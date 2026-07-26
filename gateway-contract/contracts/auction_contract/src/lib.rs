@@ -1,135 +1,127 @@
 #![cfg_attr(not(test), no_std)]
 
-//! # gateway-auction
-//!
-//! Minimal English / Dutch auction contract used by the Creditra credit
-//! contract to settle defaulted collateral. The cross-contract handoff is
-//! documented in
-//! [`docs/default-liquidation-auction-hook.md`](../../../../docs/default-liquidation-auction-hook.md);
-//! the credit-side call lives in
-//! [`crate::lib::settle_default_liquidation`](../../../../contracts/credit/src/lib.rs)
-//! (cross-repo path).
-//!
-//! ## What
-//!
-//! - English (open ascending) mode with a configurable
-//!   `min_increment_bps`. Previous highest bidder is **atomically refunded**
-//!   when outbid, under the reentrancy guard.
-//! - Dutch (descending) mode with configurable linear or stepped price decay.
-//!   Linear uses `p(t) = p_0 - (p_0 - p_f) * min(t, T) / T`; stepped uses
-//!   equal time buckets with discrete downward repricing. First qualifying bid
-//!   atomically flips status to Closed.
-//! - One-shot `settle_default_liquidation(auction_id, credit_contract, borrower)`
-//!   callable only by the registered factory (= the credit contract).
-//!   Replay-protected by the persistent
-//!   `AuctionKey::LiquidationSettled(auction_id)` flag.
-//! - `claim_auction(auction_id)` — winner-only payout under the
-//!   reentrancy guard.
-//!
-//! ## How
-//!
-//! - 12 `AuctionError` discriminants pinned by ABI;
-//!   `AuctionError::Reentrancy = 10` reverts on re-entered refund or claim.
-//! - Three event topics under stable symbols (`BID_RFDN`, `AUC_CLOSE`,
-//!   `LIQ_SETL`) — see [`events`].
-//! - Storage tier discipline mirrors the credit contract: small instance
-//!   state for the current auction, id-scoped persistent state for
-//!   multi-auction deployments. TTL bump cadence is ~30 d / ~7 d (auctions
-//!   are short-lived).
-//!
-//! ## Anti-snipe disclosure
-//!
-//! The PR #430 feature branch added an end-time-extension code path
-//! intended to push the close time out when a bid lands inside an
-//! extension window. After the reconciliation with
-//! `AUCTION_CLOSE_TIME_FIX.md`, the live [`place_bid`] hard-rejects bids
-//! when `now >= end_time` without extending. The anti-snipe behavior is
-//! therefore **documented but not active** in this release; treat it as
-//! planned, not delivered. See
-//! [`docs/SECURITY.md`](../../../../docs/SECURITY.md) §6 ("Known gaps") and
-//! [`WHITEPAPER.md`](../../../../WHITEPAPER.md) §6.3.
-//!
-//! ## Modules
-//! - [`errors`] — `AuctionError` codes used by the contract.
-//! - [`events`] — Soroban events emitted by the contract.
-//! - [`storage`] — Persistent/instance keys and TTL helpers.
-//! - [`types`] — Stored data types (`AuctionState`, etc.).
-
+pub mod curves;
 mod errors;
 mod events;
 mod storage;
 mod types;
 
+pub use curves::{calculate_price, CurveError, DecayCurve};
 pub use errors::AuctionError;
+pub use events::BidRefundedEvent;
 pub use types::{AuctionMode, AuctionState, AuctionStatus, DutchAuctionDecay};
 
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Symbol};
 
 use crate::storage::{
-    clear_reentrancy_guard, get_factory_contract, set_factory_contract, set_reentrancy_guard,
+    bump_auction_state_ttl, bump_settlement_marker_ttl, clear_reentrancy_guard,
+    get_factory_contract, set_liquidation_grace_window, set_reentrancy_guard,
 };
 use crate::types::*;
 use events::{
     publish_auction_closed_event, publish_bid_refunded_event,
     publish_default_liquidation_settlement_event,
 };
-use storage::{bump_auction_state_ttl, bump_settlement_marker_ttl};
 
-/// Returns the minimum bid that must be placed to outbid `highest_bid`.
+/// Returns the minimum bid amount that satisfies the `min_increment_bps`
+/// requirement over `highest_bid`.
 ///
-/// increment = ceil(highest_bid * min_increment_bps / 10_000)
+/// The threshold is `highest_bid + ceil(highest_bid * bps / 10_000)`, with a
+/// floor increment of 1 stroop so there is always forward progress.
 ///
-/// Ceiling is computed as `q / d + (q % d != 0)` to avoid the `q + (d-1)`
-/// addition that would overflow when q is near i128::MAX.
-///
-/// A floor of 1 stroop is applied so that a zero-bps config still requires
-/// a strictly higher bid, preventing equal-amount griefing.
-fn min_next_bid(highest_bid: i128, min_increment_bps: u32) -> i128 {
+/// # Errors
+/// Panics with [`AuctionError::BidTooLow`] on i128 overflow (requires a bid
+/// in the quintillion-strobe range; effectively unreachable in practice).
+fn min_next_bid(env: &Env, highest_bid: i128, min_increment_bps: u32) -> i128 {
     let bps = min_increment_bps as i128;
     let product = highest_bid
         .checked_mul(bps)
-        .expect("overflow in bid increment calculation");
+        .unwrap_or_else(|| env.panic_with_error(AuctionError::BidTooLow));
     let bps_increment = product / 10_000 + i128::from(product % 10_000 != 0);
-    // Always require at least +1 stroop even when bps == 0
     let increment = bps_increment.max(1);
     highest_bid
         .checked_add(increment)
-        .expect("overflow computing minimum next bid threshold")
+        .unwrap_or_else(|| env.panic_with_error(AuctionError::BidTooLow))
 }
 
 /// Computes the current Dutch auction price based on elapsed time.
 ///
-/// ### Mathematical Formula
-/// For [`DutchAuctionDecay::Linear`], the price decays continuously from
-/// `start_price` to `floor_price` over the auction `duration`:
-/// `current_price = start_price - ((start_price - floor_price) * elapsed_time) / duration`
+/// # Overview
 ///
-/// For [`DutchAuctionDecay::Stepped`], the same total drop is split into
-/// `step_count` equal time buckets and reprices only when a new bucket begins.
+/// In a Dutch (descending) auction the price starts at `start_price` and
+/// decreases over time until it reaches `floor_price` at the end of the
+/// auction window.  This function returns the price that a qualifying bid
+/// must meet (or exceed) at a given point in time.
 ///
-/// ### Parameters
-/// * `start_price` - The starting price of the auction (when `elapsed_time` is `0`).
-/// * `floor_price` - The minimum/floor price of the auction (reached when `elapsed_time >= duration`).
-/// * `elapsed_time` - The duration of time (in seconds) elapsed since the auction start.
-/// * `duration` - The total duration of the auction (in seconds).
+/// # Parameters
 ///
-/// ### Return Value
-/// Returns the calculated `i128` current price for the auction at the given `elapsed_time`.
-/// The price is guaranteed to be at least `floor_price`.
+/// | Parameter      | Description |
+/// |----------------|-------------|
+/// | `start_price`  | Price at the beginning of the auction (`t = 0`). Must be ≥ `floor_price`. |
+/// | `floor_price`  | Minimum price the auction can reach. The returned price is clamped to this value. |
+/// | `elapsed_time` | Seconds elapsed since the auction started. |
+/// | `duration`     | Total auction duration in seconds. |
+/// | `decay`        | Shape of the price-decay curve (see [`DutchAuctionDecay`]). |
+/// | `step_count`   | Required only for [`DutchAuctionDecay::Stepped`]; ignored for all other decay kinds. |
 ///
-/// ### Assumptions
-/// * `start_price >= floor_price`. If this invariant is violated, the function will panic.
+/// # Decay curves
 ///
-/// ### Edge Cases
-/// * **`duration == 0`**: Returns `floor_price` immediately to avoid division by zero.
-/// * **`elapsed_time >= duration`**: Returns `floor_price` immediately, clamping the price decay once the auction has expired.
+/// ## Linear (`DutchAuctionDecay::Linear` or `DutchAuctionDecay::None`)
 ///
-/// ### Overflow / Panic Behavior
-/// This function uses checked arithmetic to prevent overflow:
-/// * Panics with `"start_price must be >= floor_price"` if `start_price < floor_price`.
-/// * Panics with `"overflow in Dutch price calculation"` if `(start_price - floor_price) * elapsed_time` overflows `i128`.
-/// * Panics with `"current price should not underflow"` if the subtraction from `start_price` underflows.
-fn compute_dutch_price(
+/// ```text
+/// p(t) = start_price − ⌊(start_price − floor_price) × t / duration⌋
+/// ```
+///
+/// The price drops at a constant rate from `start_price` to `floor_price`.
+/// `DutchAuctionDecay::None` is treated identically to `Linear` (the
+/// default when no explicit decay is configured).
+///
+/// ## Stepped (`DutchAuctionDecay::Stepped`)
+///
+/// ```text
+/// p(t) = start_price − ⌊(start_price − floor_price) × ⌊t × steps / duration⌋ / steps⌋
+/// ```
+///
+/// This is a step-down curve: the price remains constant within each of the
+/// `step_count` equal-duration buckets and only drops at bucket boundaries.
+/// The total drop from `start_price` to `floor_price` is split across those
+/// buckets.  `step_count` **must** be `Some(n)` where `n > 0`.
+///
+/// ## Exponential (`DutchAuctionDecay::Exponential`)
+///
+/// ```text
+/// factor(t)  = 0.99 ^ min(t, 100)
+/// drop(t)    = (start_price − floor_price) × (1 − factor(t))
+/// p(t)       = start_price − drop(t)
+/// ```
+///
+/// Approximately 1 % multiplicative decay per time unit.  The
+/// iteration count is capped at 100 to bound gas consumption.
+///
+/// # Return value
+///
+/// The current Dutch auction price, guaranteed to be ≥ `floor_price`.
+///
+/// # Edge cases
+///
+/// * `duration == 0` → returns `floor_price` immediately (avoids division by zero).
+/// * `elapsed_time >= duration` → returns `floor_price` (auction window expired).
+/// * If `start_price < floor_price`, the function **panics** — callers
+///   must validate parameters at auction creation time.
+///
+/// # Examples
+///
+/// ```
+/// use gateway_auction::DutchAuctionDecay;
+///
+/// // Linear: price at start
+/// assert_eq!(compute_dutch_price(1000, 500, 0, 100, &DutchAuctionDecay::Linear, None), 1000);
+/// // Linear: price halfway
+/// assert_eq!(compute_dutch_price(1000, 500, 50, 100, &DutchAuctionDecay::Linear, None), 750);
+/// // Linear: price at end
+/// assert_eq!(compute_dutch_price(1000, 500, 100, 100, &DutchAuctionDecay::Linear, None), 500);
+/// ```
+pub fn compute_dutch_price(
     start_price: i128,
     floor_price: i128,
     elapsed_time: u64,
@@ -138,59 +130,67 @@ fn compute_dutch_price(
     step_count: Option<u32>,
 ) -> i128 {
     if duration == 0 {
-        return floor_price; // Avoid division by zero
+        return floor_price;
     }
-
     if elapsed_time >= duration {
-        return floor_price; // Clamp at floor when auction ends
+        return floor_price;
     }
 
-    // Compute total price drop
     let price_drop = start_price
         .checked_sub(floor_price)
         .expect("start_price must be >= floor_price");
 
-    // Compute the portion of time elapsed as a fraction
-    // Use checked arithmetic to prevent overflow
-    let elapsed_i128 = elapsed_time as i128;
-    let duration_i128 = duration as i128;
+    let p_u128 = price_drop as u128;
 
     let drop_so_far = match decay {
-        DutchAuctionDecay::Linear => price_drop
-            .checked_mul(elapsed_i128)
-            .expect("overflow in Dutch price calculation")
-            .checked_div(duration_i128)
-            .expect("division should succeed with positive duration"),
+        DutchAuctionDecay::None | DutchAuctionDecay::Linear => {
+            let e_u128 = elapsed_time as u128;
+            let d_u128 = duration as u128;
+
+            let q = p_u128 / d_u128;
+            let r = p_u128 % d_u128;
+
+            let drop = (q * e_u128) + ((r * e_u128) / d_u128);
+            drop as i128
+        }
+
         DutchAuctionDecay::Stepped => {
             let steps = match step_count {
-                Some(steps) if steps > 0 => i128::from(steps),
-                Some(_) => {
-                    panic!("dutch_step_count must be greater than zero for stepped Dutch auctions")
-                }
+                Some(s) if s > 0 => s as u128,
+                Some(_) => panic!("dutch_step_count must be > 0 for stepped Dutch auctions"),
                 None => panic!("dutch_step_count required for stepped Dutch auctions"),
             };
 
-            let elapsed_steps = i128::from(
-                elapsed_time
-                    .checked_mul(steps as u64)
-                    .expect("overflow in stepped Dutch step calculation")
-                    / duration,
-            );
+            let e_u128 = elapsed_time as u128;
+            let d_u128 = duration as u128;
+            let elapsed_steps = (e_u128 * steps) / d_u128;
 
-            price_drop
-                .checked_mul(elapsed_steps)
-                .expect("overflow in Dutch price calculation")
-                .checked_div(steps)
-                .expect("division should succeed with positive step count")
+            let q = p_u128 / steps;
+            let r = p_u128 % steps;
+
+            let drop = (q * elapsed_steps) + ((r * elapsed_steps) / steps);
+            drop as i128
+        }
+
+        DutchAuctionDecay::Exponential => {
+            let t = elapsed_time.min(100);
+            let mut factor = 10_000u128;
+            for _ in 0..t {
+                factor = (factor * 9_900) / 10_000;
+            }
+            let drop_factor = 10_000 - factor;
+            let q = p_u128 / 10_000;
+            let r = p_u128 % 10_000;
+
+            let drop = (q * drop_factor) + ((r * drop_factor) / 10_000);
+            drop as i128
         }
     };
 
-    // Current price = start_price - drop_so_far
     let current_price = start_price
         .checked_sub(drop_so_far)
         .expect("current price should not underflow");
 
-    // Ensure we never go below floor (shouldn't happen with correct math, but safety check)
     current_price.max(floor_price)
 }
 
@@ -206,6 +206,23 @@ pub enum AuctionKey {
 
 #[contractimpl]
 impl Auction {
+    /// Initializes a new auction.
+    ///
+    /// # Parameters
+    /// - `env`: The execution environment.
+    /// - `auction_id`: The unique identifier for the auction.
+    /// - `mode`: The mode of the auction (e.g., English or Dutch).
+    /// - `start_time`: The timestamp when the auction starts.
+    /// - `end_time`: The timestamp when the auction ends.
+    /// - `min_bid`: The minimum initial bid (English) or floor price equivalent logic.
+    /// - `min_increment_bps`: The minimum bid increment in basis points (max 10000).
+    /// - `dutch_start_price`: The starting price for a Dutch auction.
+    /// - `dutch_floor_price`: The lowest possible price for a Dutch auction.
+    /// - `dutch_decay`: The price decay configuration for a Dutch auction.
+    /// - `dutch_step_count`: Required steps if decay is `Stepped`.
+    ///
+    /// # Panics
+    /// Panics if `start_time >= end_time`, if `min_increment_bps > 10_000`, or if Dutch auction parameters are invalid.
     pub fn init_auction(
         env: Env,
         auction_id: Symbol,
@@ -222,12 +239,10 @@ impl Auction {
         if start_time >= end_time {
             panic!("invalid times");
         }
-        // Cap at 100% (10_000 bps) — a requirement higher than that is nonsensical
         if min_increment_bps > 10_000 {
             panic!("min_increment_bps exceeds maximum of 10000 (100%)");
         }
 
-        // Validate Dutch auction parameters
         if mode == AuctionMode::Dutch {
             let start = dutch_start_price.expect("dutch_start_price required for Dutch mode");
             let floor = dutch_floor_price.expect("dutch_floor_price required for Dutch mode");
@@ -239,16 +254,13 @@ impl Auction {
             }
 
             match dutch_decay.as_ref().unwrap_or(&DutchAuctionDecay::Linear) {
-                DutchAuctionDecay::Linear => {}
-                DutchAuctionDecay::Stepped => {
-                    match dutch_step_count {
-                        Some(0) => {
-                            panic!("dutch_step_count must be greater than zero for stepped Dutch auctions")
-                        }
-                        Some(_) => {}
-                        None => panic!("dutch_step_count required for stepped Dutch auctions"),
-                    }
-                }
+                DutchAuctionDecay::None | DutchAuctionDecay::Linear => {}
+                DutchAuctionDecay::Stepped => match dutch_step_count {
+                    Some(0) => panic!("dutch_step_count must be > 0 for stepped Dutch auctions"),
+                    Some(_) => {}
+                    None => panic!("dutch_step_count required for stepped Dutch auctions"),
+                },
+                DutchAuctionDecay::Exponential => {}
             }
         }
 
@@ -261,7 +273,7 @@ impl Auction {
             min_increment_bps,
             dutch_start_price,
             dutch_floor_price,
-            dutch_decay,
+            dutch_decay: dutch_decay.unwrap_or(DutchAuctionDecay::None),
             dutch_step_count,
         };
         let state = AuctionState {
@@ -274,56 +286,43 @@ impl Auction {
         bump_auction_state_ttl(&env, &auction_id);
     }
 
-    /// Register the factory/credit contract address that is permitted to call
-    /// `settle_default_liquidation`. Must be called once after deployment.
+    /// Sets the factory contract address.
+    ///
+    /// # Authorization
+    /// Requires `require_auth` from the factory itself.
     pub fn set_factory_contract(env: Env, factory: Address) {
         factory.require_auth();
         storage::set_factory_contract(&env, &factory);
     }
 
-    pub fn close_auction(env: Env, auction_id: Symbol) {
-        let mut state: AuctionState = env
-            .storage()
-            .persistent()
-            .get(&auction_id)
-            .unwrap_or_else(|| panic!("auction not found"));
-        bump_auction_state_ttl(&env, &auction_id);
-        if state.status == AuctionStatus::Claimed {
-            env.panic_with_error(AuctionError::AlreadyClaimed);
-        }
-        if state.status != AuctionStatus::Open {
-            env.panic_with_error(AuctionError::AuctionNotOpen);
-        }
-        state.status = AuctionStatus::Closed;
-        env.storage().persistent().set(&auction_id, &state);
-        bump_auction_state_ttl(&env, &auction_id);
-        publish_auction_closed_event(&env, auction_id, state.highest_bidder, state.highest_bid);
-    }
-
-    /// Place a bid for an auction identified by `auction_id`.
+    /// Places a bid on an active auction.
     ///
-    /// For English auctions:
-    /// - Bid floor: `amount` must be strictly greater than `max(min_bid - 1, highest_bid)`.
-    /// - First bid must be at least `min_bid`, every later bid must exceed the current highest.
-    /// - When outbidding, the previous highest bidder is refunded exactly `highest_bid`.
+    /// # Authorization
+    /// Requires `require_auth` from the `bidder`.
     ///
-    /// For Dutch auctions:
-    /// - First bid at or above the current Dutch price wins immediately.
-    /// - Price decays using the configured Dutch curve (`Linear` by default,
-    ///   `Stepped` when `dutch_decay` and `dutch_step_count` are set).
-    /// - No outbidding - first qualifying bid settles the auction.
+    /// # Parameters
+    /// - `env`: The execution environment.
+    /// - `auction_id`: The unique identifier of the auction.
+    /// - `bidder`: The address placing the bid.
+    /// - `amount`: The amount of the bid token being bid.
+    ///
+    /// # Panics
+    /// * [`AuctionError::BidTooLow`] - Bid amount is not strictly positive, or does not meet minimum threshold/current Dutch price.
+    /// * [`AuctionError::NotFound`] - Auction state not found.
+    /// * [`AuctionError::AuctionNotOpen`] - Auction is not in `Open` status or end time has passed.
+    /// * [`AuctionError::GracePeriodActive`] - Attempting to bid during the liquidation grace window.
     pub fn place_bid(env: Env, auction_id: Symbol, bidder: Address, amount: i128) {
         bidder.require_auth();
 
         if amount <= 0 {
-            panic!("amount must be positive");
+            env.panic_with_error(AuctionError::BidTooLow);
         }
 
         let mut state: AuctionState = env
             .storage()
             .persistent()
             .get(&auction_id)
-            .unwrap_or_else(|| panic!("auction not initialized"));
+            .unwrap_or_else(|| env.panic_with_error(AuctionError::NotFound));
         bump_auction_state_ttl(&env, &auction_id);
 
         if state.status != AuctionStatus::Open {
@@ -331,21 +330,27 @@ impl Auction {
         }
 
         let now = env.ledger().timestamp();
-
         if now >= state.config.end_time {
-            panic!("auction closed");
+            env.panic_with_error(AuctionError::AuctionNotOpen);
+        }
+
+        let grace_window = storage::get_liquidation_grace_window(&env);
+        if grace_window > 0 {
+            let earliest_start = state.config.start_time.saturating_add(grace_window);
+            if now < earliest_start {
+                env.panic_with_error(AuctionError::GracePeriodActive);
+            }
         }
 
         match state.config.mode {
             AuctionMode::English => {
-                // English auction: require bid to exceed current highest
-                let min_floor = state.config.min_bid.saturating_sub(1);
-                let required_floor = if state.highest_bid > min_floor {
-                    state.highest_bid
+                let threshold = if state.highest_bid > 0 {
+                    min_next_bid(&env, state.highest_bid, state.config.min_increment_bps)
+                        .max(state.config.min_bid)
                 } else {
-                    min_floor
+                    min_next_bid(&env, state.config.min_bid, state.config.min_increment_bps)
                 };
-                if amount <= required_floor {
+                if amount < threshold {
                     env.panic_with_error(AuctionError::BidTooLow);
                 }
 
@@ -354,16 +359,16 @@ impl Auction {
                     .instance()
                     .get(&Symbol::new(&env, "bid_token"));
 
+                if let Some(ref tkn) = token_addr {
+                    set_reentrancy_guard(&env);
+                    let token_client = token::Client::new(&env, tkn);
+                    token_client.transfer(&bidder, &env.current_contract_address(), &amount);
+                    clear_reentrancy_guard(&env);
+                }
+
                 if let (Some(prev_bidder), Some(tkn)) = (state.highest_bidder.clone(), token_addr) {
                     let refund_amount = state.highest_bid;
-
-                    // Emit refund event before performing token transfer
                     publish_bid_refunded_event(&env, prev_bidder.clone(), state.highest_bid);
-
-                    // Set reentrancy guard before the token transfer to block any
-                    // reentrant call to place_bid or claim_auction during the CPI.
-                    // Soroban transaction rollback clears instance storage on panic,
-                    // so the flag cannot be left permanently set on failure.
                     set_reentrancy_guard(&env);
                     let token_client = token::Client::new(&env, &tkn);
                     token_client.transfer(
@@ -377,12 +382,10 @@ impl Auction {
                 state.highest_bidder = Some(bidder);
                 state.highest_bid = amount;
             }
+
             AuctionMode::Dutch => {
-                // Dutch auction: first qualifying bid wins
                 let current_time = env.ledger().timestamp();
-                let elapsed_time = current_time
-                    .checked_sub(state.config.start_time)
-                    .unwrap_or(0);
+                let elapsed_time = current_time.saturating_sub(state.config.start_time);
                 let duration = state
                     .config
                     .end_time
@@ -398,11 +401,7 @@ impl Auction {
                     .dutch_floor_price
                     .unwrap_or(state.config.min_bid);
 
-                let decay = state
-                    .config
-                    .dutch_decay
-                    .clone()
-                    .unwrap_or(DutchAuctionDecay::Linear);
+                let decay = state.config.dutch_decay.clone();
 
                 let current_price = compute_dutch_price(
                     start_price,
@@ -413,22 +412,29 @@ impl Auction {
                     state.config.dutch_step_count,
                 );
 
-                // Bid must be at least current price
                 if amount < current_price {
                     env.panic_with_error(AuctionError::BidTooLow);
                 }
-
-                // Bid must be at least min_bid
                 if amount < state.config.min_bid {
                     env.panic_with_error(AuctionError::BidTooLow);
                 }
 
-                // In Dutch auction, first qualifying bid wins - close the auction
+                let token_addr: Option<Address> = env
+                    .storage()
+                    .instance()
+                    .get(&Symbol::new(&env, "bid_token"));
+
+                if let Some(ref tkn) = token_addr {
+                    set_reentrancy_guard(&env);
+                    let token_client = token::Client::new(&env, tkn);
+                    token_client.transfer(&bidder, &env.current_contract_address(), &amount);
+                    clear_reentrancy_guard(&env);
+                }
+
                 state.highest_bidder = Some(bidder);
                 state.highest_bid = amount;
                 state.status = AuctionStatus::Closed;
 
-                // Publish close event for Dutch auction settlement
                 publish_auction_closed_event(
                     &env,
                     auction_id.clone(),
@@ -442,12 +448,22 @@ impl Auction {
         bump_auction_state_ttl(&env, &auction_id);
     }
 
-    /// Emit an auction settlement signal for credit default liquidation orchestration.
+    /// Settles an auction that ended in default or completes the liquidation process.
     ///
-    /// Requirements:
-    /// - caller must be the registered factory contract (`set_factory_contract`)
-    /// - auction must be closed
-    /// - settlement signal is one-time per auction_id
+    /// Transfers the highest bid amount (if any) to the credit contract.
+    ///
+    /// # Authorization
+    /// Requires `require_auth` from the factory contract.
+    ///
+    /// # Returns
+    /// The `highest_bid` amount that was settled.
+    ///
+    /// # Panics
+    /// * [`AuctionError::NoFactoryContract`] - Factory contract not set.
+    /// * [`AuctionError::Unauthorized`] - Caller is not the factory contract.
+    /// * [`AuctionError::NotFound`] - Auction not found.
+    /// * [`AuctionError::NotClosed`] - Auction is not in the `Closed` state.
+    /// * [`AuctionError::AlreadySettled`] - Auction has already been settled.
     pub fn settle_default_liquidation(
         env: Env,
         auction_id: Symbol,
@@ -490,20 +506,44 @@ impl Auction {
         publish_default_liquidation_settlement_event(
             &env,
             auction_id,
-            credit_contract,
+            credit_contract.clone(),
             borrower,
             winner,
             state.highest_bid,
         );
 
+        let token_addr: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "bid_token"));
+        if let Some(tkn) = token_addr {
+            if state.highest_bid > 0 {
+                set_reentrancy_guard(&env);
+                let token_client = token::Client::new(&env, &tkn);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &credit_contract,
+                    &state.highest_bid,
+                );
+                clear_reentrancy_guard(&env);
+            }
+        }
+
         state.highest_bid
     }
 
-    /// Claim the auction proceeds for the winner.
-    /// Requirements:
-    /// - auction must be closed
-    /// - caller must be the winner
-    /// - auction must have a bid
+    /// Claims the proceeds or assets of a closed auction by the winning bidder.
+    ///
+    /// # Authorization
+    /// Requires `require_auth` from the winning bidder.
+    ///
+    /// # Panics
+    /// * [`AuctionError::NotFound`] - Auction not found.
+    /// * [`AuctionError::AuctionNotClosed`] - Auction is not in `Closed` status.
+    /// * [`AuctionError::AlreadySettled`] - Auction has already been liquidated/settled.
+    /// * [`AuctionError::NoWinner`] - There is no winning bidder.
+    /// * [`AuctionError::AlreadyClaimed`] - Auction was already claimed.
+    /// * [`AuctionError::InvalidState`] - Bid token not found in storage.
     pub fn claim_auction(env: Env, auction_id: Symbol) {
         let state: AuctionState = env
             .storage()
@@ -516,6 +556,16 @@ impl Auction {
             env.panic_with_error(AuctionError::AuctionNotClosed);
         }
 
+        let settlement_key = AuctionKey::LiquidationSettled(auction_id.clone());
+        let already_settled = env
+            .storage()
+            .persistent()
+            .get::<AuctionKey, bool>(&settlement_key)
+            .unwrap_or(false);
+        if already_settled {
+            env.panic_with_error(AuctionError::AlreadySettled);
+        }
+
         let winner = state
             .highest_bidder
             .clone()
@@ -526,19 +576,87 @@ impl Auction {
             env.panic_with_error(AuctionError::AlreadyClaimed);
         }
 
+        let recovered_amount = state.highest_bid;
+        let token_addr: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "bid_token"));
+        let token_addr =
+            token_addr.unwrap_or_else(|| env.panic_with_error(AuctionError::InvalidState));
+
         let mut updated_state = state;
         updated_state.status = AuctionStatus::Claimed;
         env.storage().persistent().set(&auction_id, &updated_state);
         bump_auction_state_ttl(&env, &auction_id);
 
-        // Reentrancy guard wraps the transfer site (defense-in-depth).
-        // The status is already updated to Claimed above (checks-effects-interactions),
-        // so a reentrant claim_auction call will hit AuctionNotClosed before reaching here.
-        // The guard provides an additional layer: any reentrant call during the token
-        // transfer will revert with AuctionError::Reentrancy.
         set_reentrancy_guard(&env);
-        // token_client.transfer(...) — proceeds to winner (transfer to be wired up)
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(&env.current_contract_address(), &winner, &recovered_amount);
         clear_reentrancy_guard(&env);
+    }
+
+    /// Close an auction (transition `Open` → `Closed`).
+    ///
+    /// # Authorization
+    /// Requires [`require_auth`] from the registered factory contract.
+    ///
+    /// # Panics
+    /// * [`AuctionError::NotFound`] — `auction_id` does not exist.
+    /// * [`AuctionError::AuctionNotOpen`] — auction is already `Closed`.
+    /// * [`AuctionError::AlreadyClaimed`] — auction has already been claimed.
+    pub fn close_auction(env: Env, auction_id: Symbol) {
+        let factory = get_factory_contract(&env)
+            .unwrap_or_else(|| env.panic_with_error(AuctionError::NoFactoryContract));
+        factory.require_auth();
+
+        let mut state: AuctionState = env
+            .storage()
+            .persistent()
+            .get(&auction_id)
+            .unwrap_or_else(|| env.panic_with_error(AuctionError::NotFound));
+        bump_auction_state_ttl(&env, &auction_id);
+
+        match state.status {
+            AuctionStatus::Open => {
+                state.status = AuctionStatus::Closed;
+            }
+            AuctionStatus::Closed => {
+                env.panic_with_error(AuctionError::AuctionNotOpen);
+            }
+            AuctionStatus::Claimed => {
+                env.panic_with_error(AuctionError::AlreadyClaimed);
+            }
+        }
+
+        publish_auction_closed_event(
+            &env,
+            auction_id.clone(),
+            state.highest_bidder.clone(),
+            state.highest_bid,
+        );
+
+        env.storage().persistent().set(&auction_id, &state);
+        bump_auction_state_ttl(&env, &auction_id);
+    }
+
+    /// Returns the configured liquidation grace window in seconds.
+    ///
+    /// Returns `0` if never configured (no grace period enforced).
+    pub fn get_liquidation_grace_window(env: Env) -> u64 {
+        storage::get_liquidation_grace_window(&env)
+    }
+
+    /// Sets the liquidation grace window (in seconds) for newly created auctions.
+    ///
+    /// When non-zero, bidders cannot place bids before `auction.start_time + grace_window` has elapsed.
+    ///
+    /// # Authorization
+    /// Requires [`require_auth`] from the registered factory contract.
+    pub fn set_liquidation_grace_window(env: Env, seconds: u64) {
+        let factory = get_factory_contract(&env)
+            .unwrap_or_else(|| env.panic_with_error(AuctionError::NoFactoryContract));
+        factory.require_auth();
+        set_liquidation_grace_window(&env, seconds);
     }
 }
 

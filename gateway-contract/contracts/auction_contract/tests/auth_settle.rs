@@ -20,7 +20,7 @@
 //! ```
 //!
 //! [`settle_default_liquidation`]: ../src/lib.rs
-
+use gateway_auction::DutchAuctionDecay;
 use gateway_auction::{Auction, AuctionClient, AuctionMode};
 use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
 use soroban_sdk::{Address, Env, IntoVal, Symbol};
@@ -52,7 +52,7 @@ fn setup_auction() -> (Env, Address, Symbol, Address, Address, i128) {
         &0_u32,
         &None,
         &None,
-        &None,
+        &Some(DutchAuctionDecay::None),
         &None,
     );
     client.place_bid(&auction_id, &bidder, &420_i128);

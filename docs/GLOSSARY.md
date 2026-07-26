@@ -227,6 +227,10 @@ never principal).
 formula-computed rate. Stored under `DataKey::RateFloorBps(Address)`.
 Configured by `set_borrower_rate_floor`.
 
+**Rate ceiling**. Per-borrower maximum interest rate that caps the manual or
+formula-computed rate. Stored under `DataKey::RateCeilingBps(Address)`.
+Configured by `set_borrower_rate_ceiling`.
+
 **`RateChangeConfig`**. Magnitude and cadence cap on rate changes per
 `update_risk_parameters` call. `max_rate_change_bps` and
 `rate_change_min_interval` (seconds).
@@ -312,6 +316,9 @@ credit line currently drawn.
 
 ## W
 
-**WASM size budget**. Hard CI limit: 50 KB
-(`THRESHOLD_BYTES=51200` in `.github/workflows/ci.yml`). Achieved via
+**WASM size budget**. Two CI limits: (1) **50 KB** for `creditra_credit.wasm`
+only (`THRESHOLD_BYTES=51200` in `.github/workflows/ci.yml` and
+`build-wasm.yml`); (2) **100 KiB** for every workspace contract WASM
+(`scripts/check-wasm-size.sh`, `.github/workflows/wasm-size.yml`,
+`THRESHOLD_BYTES=102400`). Achieved via
 `opt-level = "z"`, full LTO, stripped symbols, single codegen unit.
